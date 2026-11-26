@@ -32,7 +32,7 @@ Variables d'environnement :
     HOST / PORT           (défaut : 0.0.0.0:8000)
 
 Endpoints :
-    GET  /api/status, /api/robots, /api/agents, /api/catalog, /api/files
+    GET  /api/status, /api/visits, /api/robots, /api/agents, /api/catalog, /api/files
     GET  /api/google/callback, /api/oauth/callback  (callbacks publics OAuth)
     POST /api/ai, /api/publish, /api/robots/run
     POST /api/credentials, /api/catalog  (catalogue synchronisé prix/images)
@@ -44,6 +44,7 @@ Endpoints :
     POST /api/google/sync, /api/google/restore
     GET  /api/messages, /api/messages/config, /api/messages/file/<nom>  (messagerie publique)
     POST /api/messages, /api/messages/subscribe  (messagerie et notifications push)
+    POST /api/visits  (signal de visite du site, publié sans jeton)
 """
 
 import hmac
@@ -474,7 +475,7 @@ class Handler(BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(parsed.query)
         # Le statut public et les callbacks OAuth doivent rester accessibles sans
         # jeton partagé ; tous les autres GET exposent des données ou des liens sensibles.
-        public_gets = ("/api/status", "/api/oauth/providers", "/api/google/callback", "/api/oauth/callback",
+        public_gets = ("/api/status", "/api/visits", "/api/oauth/providers", "/api/google/callback", "/api/oauth/callback",
                        "/api/messages/config", "/api/messages")
         public_get = path in public_gets or path.startswith("/api/messages/file/")
         if not public_get and not self._authorized():
@@ -503,6 +504,10 @@ class Handler(BaseHTTPRequestHandler):
                         "redirectUri": oauth.redirect_uri(base) if base else "",
                     })
                 self._send(payload)
+                return
+            if path == "/api/visits":
+                import visits
+                self._send(visits.summary())
                 return
             if path == "/api/oauth/providers":
                 import oauth
@@ -645,7 +650,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = self.path.split("?")[0]
         # L'essai IA du visiteur reste public ; le quota est appliqué côté serveur.
-        public_posts = ("/api/messages", "/api/messages/subscribe", "/api/ai")
+        public_posts = ("/api/messages", "/api/messages/subscribe", "/api/ai", "/api/visits")
         if path not in public_posts and not self._authorized():
             return
         try:
@@ -742,6 +747,12 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/google/restore":
                 import google
                 self._send({"ok": True, "data": google.download(str(data.get("id") or ""))})
+                return
+            if path == "/api/visits":
+                import visits
+                payload = dict(data)
+                payload["_ip"] = self._client_ip()
+                self._send(visits.track(payload))
                 return
             if path == "/api/messages":
                 import messages

@@ -2,6 +2,9 @@
 
 Proxy gratuit déployé sur Render : IA, réseaux sociaux, Google Drive, OAuth, fichiers et messagerie site ↔ application. Les secrets restent sur le serveur dans `vault.json` chiffré (`TUS_VAULT_KEY`) ou dans les variables d’environnement. Aucune clé n’est envoyée au navigateur.
 
+**URL publique :** `https://touchunique-serveur.onrender.com`  
+Le site `https://phelobig.github.io/touchunique-site/?v=18` est préconnecté à cette URL : l’envoi d’un message ne demande aucun jeton au visiteur. L’application administrateur utilise la même URL avec la clé `X-Tus-Key` saisie dans ses réglages.
+
 ## Démarrage
 
 ```bash
@@ -14,7 +17,8 @@ Variables :
 - `TUS_VAULT_KEY` : clé du coffre chiffré (générée automatiquement par Render).
 - `TUS_PROXY_TOKEN` : clé partagée `X-Tus-Key` pour les appels administrateur (IA, fichiers, réponses messagerie, publication). Les visiteurs du site n’en ont pas besoin.
 - `ALLOWED_ORIGINS` : origines autorisées, séparées par des virgules.
-- `TUS_GOOGLE_REDIRECT_URI`, `TUS_OAUTH_REDIRECT_URI` : callbacks HTTPS à déclarer chez les fournisseurs.
+- `GOOGLE_REDIRECT_URI` : callback Google (`https://touchunique-serveur.onrender.com/api/google/callback`).
+- `PUBLIC_BASE_URL` : base HTTPS publique utilisée pour tous les callbacks OAuth (`oauth.redirect_uri` est calculé depuis cette valeur).
 
 ## Messagerie site ↔ application
 
@@ -24,6 +28,13 @@ Routes publiques :
 - `GET /api/messages?thread=<id>&token=<même id>` : conversations d’un visiteur (le jeton prouve qu’il possède l’identifiant généré localement).
 - `POST /api/messages` : message visiteur (`thread`, `token`, `name`, `phone`, `email`, `text`, `kind`) ou pièce jointe base64.
 - `POST /api/messages/subscribe` : abonnement Web Push du visiteur ou de l’administrateur.
+
+## Compteur de visiteurs
+
+- `GET /api/visits` : totaux publics (`total`, `today`, `views`, `online`) — aucun jeton requis.
+- `POST /api/visits` : signal envoyé par le site à chaque visite, sans jeton ni donnée personnelle.
+- Les totaux sont persistés dans `data/visits.json` côté serveur. Le suivi continue donc même quand l’application est fermée ou que l’administrateur est déconnecté.
+- L’application affiche le compteur dans la barre supérieure et le rafraîchit chaque minute ; hors ligne, elle affiche le dernier relevé enregistré localement.
 - `GET /api/messages/file/<nom>` : pièce jointe.
 
 Routes administrateur (`X-Tus-Key`) :
