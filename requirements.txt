@@ -1,4 +1,0 @@
-# Le proxy reste compatible avec la bibliothèque standard Python.
-# pywebpush n'est utilisé que pour les notifications push Web ; le serveur
-# continue de fonctionner (messagerie incluse) si l'installation échoue.
-pywebpush>=2.4,<3
