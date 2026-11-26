@@ -818,6 +818,8 @@ def main():
     print("Proxy Touch Unique sur http://%s:%s" % (host, port), flush=True)
     print("IA :", configured_providers(), flush=True)
     print("Réseaux :", configured_networks(), flush=True)
+    import messages
+    print("Web Push :", "activé" if messages.ensure_keys() else "désactivé", flush=True)
     if env_flag("TUS_ROBOT_AUTORUN"):
         threading.Thread(target=robot_scheduler, daemon=True, name="tus-robots").start()
         print("Robots quotidiens activés à", str(os.environ.get("TUS_ROBOT_HOUR", "8")) + " h",

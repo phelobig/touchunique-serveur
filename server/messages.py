@@ -9,6 +9,7 @@ Aucun statut « envoyé » n'est renvoyé sans écriture réussie sur le disque.
 
 import base64
 import binascii
+import hashlib
 import ipaddress
 import json
 import os
@@ -27,6 +28,7 @@ STORE = DATA / "messages.json"
 FILES = DATA / "messages"
 LOCK = threading.Lock()
 RATE = {}
+_DERIVED_VAPID = None
 
 THREAD_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 MIME_EXT = {
@@ -83,10 +85,68 @@ def _clean(value, limit=3000):
     return str(value or "").strip()[:limit]
 
 
+def _derived_vapid():
+    """Clés VAPID stables, dérivées du secret maître déjà présent sur le serveur.
+
+    Le disque du plan gratuit Render est temporaire : des clés aléatoires
+    enregistrées dans le coffre disparaîtraient à chaque redéploiement et
+    invalideraient tous les abonnements push. La dérivation depuis
+    TUS_VAULT_KEY (déjà défini par le Blueprint) garde la même paire de clés
+    sans transport secret supplémentaire. Des clés explicitement fournies
+    dans le coffre ou l'environnement restent prioritaires.
+    """
+    global _DERIVED_VAPID
+    if _DERIVED_VAPID is not None:
+        return _DERIVED_VAPID
+    try:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+    except ImportError:
+        return None
+    master = os.environ.get("TUS_VAULT_KEY", "").strip().encode("utf-8")
+    if not master:
+        try:
+            import vault
+            master = vault._master()
+        except Exception:
+            return None
+    if not master:
+        return None
+    seed = hashlib.pbkdf2_hmac("sha256", master, b"touchunique-vapid-v1", 120000, dklen=32)
+    curve = ec.SECP256R1()
+    scalar = int.from_bytes(seed, "big") % (curve.group_order - 1) + 1
+    key = ec.derive_private_key(scalar, curve)
+    raw = key.public_key().public_bytes(
+        serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint
+    )
+    encode = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode("ascii")
+    private_raw = scalar.to_bytes(32, "big")
+    _DERIVED_VAPID = (encode(raw), encode(private_raw))
+    return _DERIVED_VAPID
+
+
+def _normalize_private(value):
+    """pywebpush attend une clé base64url brute, pas un PEM."""
+    text = str(value or "").strip()
+    if "-----BEGIN" not in text:
+        return text
+    try:
+        from cryptography.hazmat.primitives import serialization
+        key = serialization.load_pem_private_key(text.encode("ascii"), password=None)
+        raw = key.private_numbers().private_value.to_bytes(32, "big")
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+    except Exception:
+        return text
+
+
 def _vapid():
     import vault
     pub = vault.secret("vapid_public", "VAPID_PUBLIC_KEY")
-    private = vault.secret("vapid_private", "VAPID_PRIVATE_KEY")
+    private = _normalize_private(vault.secret("vapid_private", "VAPID_PRIVATE_KEY"))
+    if not (pub and private):
+        derived = _derived_vapid()
+        if derived:
+            pub, private = derived
     base = os.environ.get("PUBLIC_BASE_URL", "").strip()
     host = urllib.parse.urlsplit(base).hostname or "localhost"
     subject = vault.secret("vapid_subject", "VAPID_SUBJECT") or "mailto:admin@" + host
@@ -94,32 +154,9 @@ def _vapid():
 
 
 def ensure_keys():
-    """Génère des clés VAPID une seule fois et les garde dans le coffre chiffré."""
-    pub, private, subject = _vapid()
-    if pub and private:
-        return True
-    try:
-        from cryptography.hazmat.primitives import serialization
-        from cryptography.hazmat.primitives.asymmetric import ec
-        import base64 as b64
-    except ImportError:
-        return False
-    key = ec.generate_private_key(ec.SECP256R1())
-    raw = key.public_key().public_bytes(
-        serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint
-    )
-    encode = lambda b: b64.urlsafe_b64encode(b).rstrip(b"=").decode("ascii")
-    public = encode(raw)
-    private_pem = key.private_bytes(
-        serialization.Encoding.PEM,
-        serialization.PrivateFormat.PKCS8,
-        serialization.NoEncryption(),
-    ).decode("ascii")
-    import vault
-    vault.set("secrets", "vapid_public", public)
-    vault.set("secrets", "vapid_private", private_pem)
-    vault.set("secrets", "vapid_subject", subject)
-    return True
+    """Prépare les clés VAPID ; rien n'est écrit sur un disque temporaire."""
+    pub, private, _ = _vapid()
+    return bool(pub and private)
 
 
 def config():

@@ -45,7 +45,7 @@ Routes administrateur (`X-Tus-Key`) :
 
 Stockage : `server/data/messages.json` et `server/data/messages/`. Limite 8 Mo par pièce jointe et 40 messages par conversation sur 10 minutes. Aucun accusé de réception n’est affiché côté site sans réponse positive du serveur.
 
-Notifications Web Push : `pywebpush` (voir `requirements.txt`). Les clés VAPID sont générées une seule fois dans le coffre via `python -c "import messages; messages.ensure_keys()"`. Android utilise un `AlarmManager` toutes les 5 minutes avec notification native, même hors application. Windows notifie via Electron lorsque l’application est ouverte.
+Notifications Web Push : `pywebpush` (voir `requirements.txt`). Les clés VAPID sont dérivées automatiquement de `TUS_VAULT_KEY` au démarrage, donc stables même après un redéploiement sur le disque temporaire de Render. Des clés explicites restent possibles via `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY` et `VAPID_SUBJECT` (ou le coffre chiffré). Vérification : `GET /api/messages/config` doit renvoyer `enabled: true` et une `publicKey`. Android utilise un `AlarmManager` toutes les 5 minutes avec notification native, même hors application. Windows notifie via Electron lorsque l’application est ouverte.
 
 ## Sécurité
 
