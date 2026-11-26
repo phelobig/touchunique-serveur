@@ -1,0 +1,36 @@
+services:
+  - type: web
+    name: touchunique-serveur
+    runtime: python3
+    plan: free
+    buildCommand: pip install -r server/requirements.txt
+    startCommand: python server/proxy.py
+    envVars:
+      - key: ALLOWED_ORIGINS
+        value: https://phelobig.github.io,https://phelobig.github.io/touchunique-site,https://phelobig.github.io/touchunique-app,app://-,file://
+      - key: TUS_VAULT_KEY
+        generateValue: true
+      - key: TUS_PROXY_TOKEN
+        generateValue: true
+      - key: TUS_ROBOT_AUTORUN
+        value: "1"
+      - key: TUS_ROBOT_HOUR
+        value: "0"
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: 8000
+      - key: OPENAI_API_KEY
+        value: ""
+      - key: GEMINI_API_KEY
+        value: ""
+      - key: ANTHROPIC_API_KEY
+        value: ""
+      - key: PERPLEXITY_API_KEY
+        value: ""
+      - key: GOOGLE_CLIENT_ID
+        value: ""
+      - key: GOOGLE_CLIENT_SECRET
+        value: ""
+      - key: GOOGLE_REDIRECT_URI
+        value: ""
