@@ -475,7 +475,7 @@ class Handler(BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(parsed.query)
         # Le statut public et les callbacks OAuth doivent rester accessibles sans
         # jeton partagé ; tous les autres GET exposent des données ou des liens sensibles.
-        public_gets = ("/api/status", "/api/visits", "/api/oauth/providers", "/api/google/callback", "/api/oauth/callback",
+        public_gets = ("/api/status", "/api/visits", "/api/catalog", "/api/oauth/providers", "/api/google/callback", "/api/oauth/callback",
                        "/api/messages/config", "/api/messages")
         public_get = path in public_gets or path.startswith("/api/messages/file/")
         if not public_get and not self._authorized():
