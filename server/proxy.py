@@ -64,7 +64,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "https://phelobig.github.io").rstrip("/")
 ALLOWED_ORIGINS = {
     o.strip().rstrip("/") for o in os.environ.get(
-        "ALLOWED_ORIGINS", ALLOWED_ORIGIN + ",http://localhost:8086,http://127.0.0.1:8086,app://-"
+        "ALLOWED_ORIGINS", ALLOWED_ORIGIN + ",http://localhost:8086,http://127.0.0.1:8086,app://-,https://app.touchunique.local"
     ).split(",") if o.strip() and o.strip() != "null"
 }
 PROXY_TOKEN = os.environ.get("TUS_PROXY_TOKEN", "").strip()
@@ -138,6 +138,7 @@ MODELS = {
     "gemini": os.environ.get("GEMINI_MODEL", "gemini-1.5-flash"),
     "anthropic": os.environ.get("ANTHROPIC_MODEL", "claude-3-5-haiku-latest"),
     "perplexity": os.environ.get("PERPLEXITY_MODEL", "sonar"),
+    "web": os.environ.get("POLLINATIONS_MODEL", "openai"),
 }
 
 
@@ -149,6 +150,9 @@ def configured_providers():
             "gemini": vault.has("gemini_api_key", "GEMINI_API_KEY"),
             "anthropic": vault.has("anthropic_api_key", "ANTHROPIC_API_KEY"),
             "perplexity": vault.has("perplexity_api_key", "PERPLEXITY_API_KEY"),
+            # Fournisseur public sans clé : l'IA du site et de l'application
+            # dispose toujours d'un accès Internet réel côté serveur.
+            "web": True,
         }
     return cached("providers", build)
 
@@ -266,6 +270,66 @@ def call_perplexity(prompt, system, max_tokens):
     return text, MODELS["perplexity"]
 
 
+def web_context(prompt):
+    """Contexte public réel, récupéré côté serveur sans clé ni secret.
+
+    Wikipédia est utilisé comme source ouverte et vérifiable. Les extraits sont
+    courts et injectés dans la consigne : le modèle reste libre de répondre
+    avec ses propres connaissances si la recherche ne donne rien.
+    """
+    terms = re.findall(r"[A-Za-zÀ-ÿ0-9]{4,}", str(prompt or ""))[:8]
+    if not terms:
+        return "", []
+    query = urllib.parse.quote_plus(" ".join(terms))
+    url = ("https://fr.wikipedia.org/w/api.php?action=query&list=search&srsearch="
+           + query + "&format=json&srlimit=3")
+    try:
+        _, body = http_json(url, None, {"Accept": "application/json"}, method="GET")
+        items = (body.get("query") or {}).get("search") or []
+    except Exception:
+        return "", []
+    lines = []
+    sources = []
+    for item in items[:3]:
+        title = html.unescape(str(item.get("title") or "")).strip()
+        snippet = re.sub(r"<[^>]+>", "", str(item.get("snippet") or ""))
+        snippet = html.unescape(snippet).strip()
+        if title and snippet:
+            lines.append("- " + title[:80] + " : " + snippet[:240])
+            sources.append({
+                "title": title[:80],
+                "url": "https://fr.wikipedia.org/wiki/" + urllib.parse.quote(title.replace(" ", "_"))
+            })
+    if not lines:
+        return "", []
+    return "\n\nContexte Internet vérifié (Wikipédia) :\n" + "\n".join(lines), sources
+
+
+def call_web(prompt, system, max_tokens):
+    """IA en ligne sans clé : accès Internet permanent pour site et application."""
+    context, sources = web_context(prompt)
+    base = str(system or "").strip()
+    if context:
+        base = (base + "\n" if base else "") + "Utilise le contexte suivant s'il est utile, en restant exact." + context
+    messages = []
+    if base:
+        messages.append({"role": "system", "content": base[:3500]})
+    messages.append({"role": "user", "content": prompt})
+    payload = {
+        "model": MODELS["web"],
+        "messages": messages,
+        "max_tokens": max_tokens,
+    }
+    _, body = http_json("https://text.pollinations.ai/openai", payload)
+    choices = body.get("choices") or []
+    text = ""
+    if choices:
+        text = str((choices[0].get("message") or {}).get("content") or "").strip()
+    if not text:
+        raise RuntimeError("Réponse IA Internet vide")
+    return text, str(body.get("model") or MODELS["web"]), sources
+
+
 def run_ai(data):
     prompt = str(data.get("prompt") or "").strip()
     if not prompt:
@@ -275,17 +339,38 @@ def run_ai(data):
     provider = str(data.get("provider") or "auto").lower()
     providers = configured_providers()
 
+    funcs = {"openai": call_openai, "gemini": call_gemini,
+             "anthropic": call_anthropic, "perplexity": call_perplexity,
+             "web": call_web}
     if provider == "auto":
-        for name in ("perplexity", "openai", "gemini", "anthropic"):
-            if providers[name]:
-                provider = name
-                break
+        # Le fournisseur Web public est essayé en premier : accès Internet
+        # permanent, sans clé et sans quota. Les fournisseurs avec clé servent
+        # de repli si le service public est momentanément indisponible.
+        errors = []
+        for name in ("web", "perplexity", "openai", "gemini", "anthropic"):
+            if not providers.get(name):
+                continue
+            try:
+                result = funcs[name](prompt, system, max_tokens)
+                if name == "web" and len(result) == 3:
+                    text, model, sources = result
+                    return {"ok": True, "provider": name, "model": model,
+                            "text": text, "sources": sources}
+                text, model = result
+                return {"ok": True, "provider": name, "model": model, "text": text}
+            except Exception as e:
+                print("IA %s indisponible : %s" % (name, str(e)[:180]), file=sys.stderr, flush=True)
+                errors.append(name)
+        raise RuntimeError("Aucun fournisseur IA disponible (" + ", ".join(errors) + ")")
+
     if provider not in providers or not providers.get(provider):
         raise ValueError("Fournisseur IA non connecté : " + provider)
-
-    funcs = {"openai": call_openai, "gemini": call_gemini,
-             "anthropic": call_anthropic, "perplexity": call_perplexity}
-    text, model = funcs[provider](prompt, system, max_tokens)
+    result = funcs[provider](prompt, system, max_tokens)
+    if provider == "web" and len(result) == 3:
+        text, model, sources = result
+        return {"ok": True, "provider": provider, "model": model,
+                "text": text, "sources": sources}
+    text, model = result
     return {"ok": True, "provider": provider, "model": model, "text": text}
 
 
@@ -491,7 +576,7 @@ class Handler(BaseHTTPRequestHandler):
                     "ai": configured_providers(),
                     "social": configured_networks(),
                     "messages": {"ok": True, "enabled": messages.config()["enabled"]},
-                    "version": 4,
+                    "version": 5,
                 }
                 if self._is_admin():
                     import google, oauth
@@ -617,6 +702,10 @@ class Handler(BaseHTTPRequestHandler):
                 import google
                 self._send({"ok": True, "data": google.download((query.get("id") or [""])[0])})
                 return
+            if path == "/api/visits/details":
+                import visits
+                self._send(visits.details((query.get("limit") or [100])[0]))
+                return
             if path == "/api/messages/config":
                 import messages
                 self._send(messages.config())
@@ -666,7 +755,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._send({"ok": False, "error": "Trop de requêtes. Réessayez dans quelques minutes."}, 429)
                 return
             if path == "/api/ai":
-                if not ai_quota_ok(self._client_ip(), self._is_admin()):
+                wanted = str(data.get("provider") or "auto").lower()
+                available = configured_providers()
+                # Le fournisseur Web est public et sans clé : pas de quota pour lui.
+                free_web = wanted == "web" or (wanted == "auto" and available.get("web"))
+                if not free_web and not ai_quota_ok(self._client_ip(), self._is_admin()):
                     raise ValueError("Vos 2 essais IA gratuits du jour sont utilisés. Demandez un accès complet sur WhatsApp.")
                 self._send(run_ai(data))
                 return

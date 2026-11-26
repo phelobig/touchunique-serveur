@@ -1,7 +1,7 @@
 services:
   - type: web
     name: touchunique-serveur
-    runtime: python3
+    runtime: python
     plan: free
     buildCommand: pip install -r server/requirements.txt
     startCommand: python server/proxy.py
@@ -35,9 +35,9 @@ services:
       - key: GOOGLE_CLIENT_SECRET
         value: ""
       - key: GOOGLE_REDIRECT_URI
-        value: ""
+        value: https://touchunique-serveur.onrender.com/api/google/callback
       - key: PUBLIC_BASE_URL
-        value: ""
+        value: https://touchunique-serveur.onrender.com
       - key: FACEBOOK_APP_ID
         value: ""
       - key: FACEBOOK_APP_SECRET
