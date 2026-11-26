@@ -35,6 +35,7 @@ Routes publiques :
 - `POST /api/visits` : signal envoyé par le site à chaque visite, sans jeton ni donnée personnelle.
 - Les totaux sont persistés dans `data/visits.json` côté serveur. Le suivi continue donc même quand l’application est fermée ou que l’administrateur est déconnecté.
 - L’application affiche le compteur dans la barre supérieure et le rafraîchit chaque minute ; hors ligne, elle affiche le dernier relevé enregistré localement.
+- Attention : sur l’offre Render gratuite le système de fichiers est temporaire. Les compteurs survivent aux redémarrages de l’application mais sont réinitialisés lors d’un redéploiement. Pour une conservation définitive, attachez un disque Render payant ou une base externe et pointez `visits.STORE` dessus.
 - `GET /api/messages/file/<nom>` : pièce jointe.
 
 Routes administrateur (`X-Tus-Key`) :
