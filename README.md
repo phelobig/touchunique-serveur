@@ -28,6 +28,13 @@ Routes publiques :
 - `GET /api/messages?thread=<id>&token=<même id>` : conversations d’un visiteur (le jeton prouve qu’il possède l’identifiant généré localement).
 - `POST /api/messages` : message visiteur (`thread`, `token`, `name`, `phone`, `email`, `text`, `kind`) ou pièce jointe base64.
 - `POST /api/messages/subscribe` : abonnement Web Push du visiteur ou de l’administrateur.
+
+## Compteur de visiteurs
+
+- `GET /api/visits` : totaux publics (`total`, `today`, `views`, `online`) — aucun jeton requis.
+- `POST /api/visits` : signal envoyé par le site à chaque visite, sans jeton ni donnée personnelle.
+- Les totaux sont persistés dans `data/visits.json` côté serveur. Le suivi continue donc même quand l’application est fermée ou que l’administrateur est déconnecté.
+- L’application affiche le compteur dans la barre supérieure et le rafraîchit chaque minute ; hors ligne, elle affiche le dernier relevé enregistré localement.
 - `GET /api/messages/file/<nom>` : pièce jointe.
 
 Routes administrateur (`X-Tus-Key`) :
