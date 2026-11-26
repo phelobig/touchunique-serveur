@@ -70,17 +70,28 @@ def write_state(state):
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def folder_slug(value):
+    import re
+    import unicodedata
+    clean = unicodedata.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode("ascii")
+    clean = re.sub(r"[^A-Za-z0-9-]+", "-", clean).strip("-")[:60]
+    return "IA-" + (clean or "robot")
+
+
 def config():
-    """Configuration quotidienne de chaque robot : actif, heure, fournisseur, consigne."""
+    """Configuration quotidienne : nom, icône, dossier propre, heure, fournisseur, consigne."""
     import json
-    base = [dict(r, enabled=True, hour=8, provider="auto") for r in ROBOTS]
+    base = [dict(r, enabled=True, hour=8, provider="auto",
+                 folder=folder_slug(r["name"])) for r in ROBOTS]
     if CONFIG_FILE.exists():
         try:
             saved = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
             by_id = {x["id"]: x for x in saved if isinstance(x, dict) and x.get("id")}
             for item in base:
                 item.update({k: v for k, v in by_id.get(item["id"], {}).items()
-                             if k in ("enabled", "hour", "provider", "topic", "desc", "name")})
+                             if k in ("enabled", "hour", "provider", "topic", "desc",
+                                      "name", "icon", "color", "folder")})
+                item["folder"] = folder_slug(item.get("folder") or item.get("name") or item["id"])
         except Exception:
             pass
     return base
@@ -101,6 +112,9 @@ def save_config(items):
             "topic": str(item.get("topic") or "")[:600],
             "desc": str(item.get("desc") or "")[:300],
             "name": str(item.get("name") or "")[:120],
+            "icon": str(item.get("icon") or "")[:12],
+            "color": str(item.get("color") or "")[:20],
+            "folder": folder_slug(item.get("folder") or item.get("name") or item["id"]),
         })
     if not clean:
         clean = config()
@@ -140,7 +154,7 @@ def run_robot(rid, dry_run=False, publish=True):
         return {"ok": False, "error": "Génération IA impossible : " + str(e)[:500]}
 
     text = result["text"]
-    folder = OUTPUT / robot["kind"]
+    folder = OUTPUT / folder_slug(robot.get("folder") or robot.get("name") or rid)
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / (date.today().isoformat() + ".md")
     path.write_text("# " + robot["name"] + "\n\n" + text + "\n", encoding="utf-8")
@@ -149,6 +163,8 @@ def run_robot(rid, dry_run=False, publish=True):
         "ok": True,
         "id": rid,
         "name": robot["name"],
+        "icon": robot.get("icon", ""),
+        "folder": robot.get("folder", ""),
         "provider": result["provider"],
         "model": result["model"],
         "text": text,

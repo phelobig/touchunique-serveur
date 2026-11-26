@@ -23,19 +23,27 @@ Variables d'environnement :
     GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / GOOGLE_REDIRECT_URI
     TUS_VAULT_KEY         clé maître du coffre chiffré (sinon fichier .vault_key)
     ALLOWED_ORIGINS       origines autorisées, séparées par des virgules
-    FACEBOOK_ACCESS_TOKEN / FACEBOOK_PAGE_ID
-    INSTAGRAM_ACCESS_TOKEN / INSTAGRAM_USER_ID
-    LINKEDIN_ACCESS_TOKEN / LINKEDIN_ORG_ID
+    FACEBOOK_ACCESS_TOKEN / FACEBOOK_PAGE_ID / FACEBOOK_APP_ID / FACEBOOK_APP_SECRET
+    INSTAGRAM_ACCESS_TOKEN / INSTAGRAM_USER_ID / INSTAGRAM_APP_ID / INSTAGRAM_APP_SECRET
+    LINKEDIN_ACCESS_TOKEN / LINKEDIN_ORG_ID / LINKEDIN_PERSON_ID
+    LINKEDIN_CLIENT_ID / LINKEDIN_CLIENT_SECRET
+    X_ACCESS_TOKEN / X_USER_ID / X_CLIENT_ID / X_CLIENT_SECRET
+    PUBLIC_BASE_URL       (utilisé pour construire les URI de callback OAuth)
     HOST / PORT           (défaut : 0.0.0.0:8000)
 
 Endpoints :
-    GET  /api/status, /api/robots, /api/agents, /api/catalog, /api/files, /api/google/callback
+    GET  /api/status, /api/robots, /api/agents, /api/catalog, /api/files
+    GET  /api/google/callback, /api/oauth/callback  (callbacks publics OAuth)
     POST /api/ai, /api/publish, /api/robots/run
     POST /api/credentials, /api/catalog  (catalogue synchronisé prix/images)
     POST /api/agents, /api/pipeline/run, /api/files/upload
     POST /api/media/analyze, /api/media/mission  (analyse multimédia par IA)
     GET  /api/google/status, /api/google/auth-url, /api/google/backups
+    GET  /api/oauth/providers, /api/oauth/auth-url
+    POST /api/oauth/disconnect
     POST /api/google/sync, /api/google/restore
+    GET  /api/messages, /api/messages/config, /api/messages/file/<nom>  (messagerie publique)
+    POST /api/messages, /api/messages/subscribe  (messagerie et notifications push)
 """
 
 import json
@@ -91,7 +99,9 @@ def configured_networks():
         "instagram": vault.has("instagram_token", "INSTAGRAM_ACCESS_TOKEN") and
                      vault.has("instagram_user", "INSTAGRAM_USER_ID"),
         "linkedin": vault.has("linkedin_token", "LINKEDIN_ACCESS_TOKEN") and
-                    vault.has("linkedin_org", "LINKEDIN_ORG_ID"),
+                    (vault.has("linkedin_person", "LINKEDIN_PERSON_ID") or
+                     vault.has("linkedin_org", "LINKEDIN_ORG_ID")),
+        "x": vault.has("x_token", "X_ACCESS_TOKEN") and vault.has("x_user", "X_USER_ID"),
     }
 
 
@@ -253,9 +263,11 @@ def run_publish(data):
 
     if network == "linkedin":
         token = _secret("linkedin_token", "LINKEDIN_ACCESS_TOKEN")
+        person = _secret("linkedin_person", "LINKEDIN_PERSON_ID")
         org = _secret("linkedin_org", "LINKEDIN_ORG_ID")
+        author = ("urn:li:person:" + person) if person else ("urn:li:organization:" + org)
         payload = {
-            "author": "urn:li:organization:" + org,
+            "author": author,
             "lifecycleState": "PUBLISHED",
             "specificContent": {
                 "com.linkedin.ugc.ShareContent": {
@@ -272,6 +284,15 @@ def run_publish(data):
         )
         return {"ok": True, "network": network, "id": body.get("id"), "status": status}
 
+    if network == "x":
+        token = _secret("x_token", "X_ACCESS_TOKEN")
+        status, body = http_json(
+            "https://api.x.com/2/tweets",
+            {"text": text},
+            {"Authorization": "Bearer " + token},
+        )
+        return {"ok": True, "network": network, "id": (body.get("data") or {}).get("id"), "status": status}
+
     raise ValueError("Réseau non pris en charge : " + network)
 
 
@@ -279,15 +300,31 @@ SECRET_KEYS = {
     "openai": "openai_api_key", "gemini": "gemini_api_key",
     "anthropic": "anthropic_api_key", "perplexity": "perplexity_api_key",
     "facebook": "facebook_token", "facebook_page": "facebook_page",
+    "facebook_app_id": "facebook_app_id", "facebook_app_secret": "facebook_app_secret",
     "instagram": "instagram_token", "instagram_user": "instagram_user",
+    "instagram_app_id": "instagram_app_id", "instagram_app_secret": "instagram_app_secret",
     "linkedin": "linkedin_token", "linkedin_org": "linkedin_org",
+    "linkedin_person": "linkedin_person",
+    "linkedin_client_id": "linkedin_client_id", "linkedin_client_secret": "linkedin_client_secret",
+    "x": "x_token", "x_user": "x_user",
+    "x_client_id": "x_client_id", "x_client_secret": "x_client_secret",
     "google_client_id": "google_client_id", "google_client_secret": "google_client_secret",
     "google_redirect_uri": "google_redirect_uri",
 }
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "TouchUniqueProxy/2.0"
+    server_version = "TouchUniqueProxy/2.1"
+
+    def _public_base(self):
+        configured = os.environ.get("PUBLIC_BASE_URL", "").strip().rstrip("/")
+        if configured:
+            return configured
+        host = (self.headers.get("X-Forwarded-Host") or self.headers.get("Host") or "localhost:8000").split(",")[0].strip()
+        proto = (self.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip()
+        if not proto:
+            proto = "https" if not (host.startswith("localhost") or host.startswith("127.0.0.1")) else "http"
+        return proto + "://" + host
 
     def _cors_origin(self):
         origin = (self.headers.get("Origin") or "").rstrip("/")
@@ -312,6 +349,13 @@ class Handler(BaseHTTPRequestHandler):
         self._headers(status, "text/html; charset=utf-8")
         self.wfile.write(page.encode("utf-8"))
 
+    def _bytes(self, content, mime, status=200):
+        self._headers(status, mime)
+        self.wfile.write(content)
+
+    def _is_admin(self):
+        return bool(PROXY_TOKEN and self.headers.get("X-Tus-Key") == PROXY_TOKEN)
+
     def _authorized(self):
         origin = (self.headers.get("Origin") or "").rstrip("/")
         if origin and origin not in ALLOWED_ORIGINS and origin not in ("null", "file://"):
@@ -329,22 +373,37 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlsplit(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
-        # Le statut public et le callback Google doivent rester accessibles sans
+        # Le statut public et les callbacks OAuth doivent rester accessibles sans
         # jeton partagé ; tous les autres GET exposent des données ou des liens sensibles.
-        if path not in ("/api/status", "/api/google/callback") and not self._authorized():
+        public_gets = ("/api/status", "/api/oauth/providers", "/api/google/callback", "/api/oauth/callback",
+                       "/api/messages/config", "/api/messages")
+        public_get = path in public_gets or path.startswith("/api/messages/file/")
+        if not public_get and not self._authorized():
             return
         try:
             if path == "/api/status":
-                import google
+                import google, oauth, messages
                 self._send({
                     "ok": True,
+                    "messages": messages.overview(),
                     "ai": configured_providers(),
                     "social": configured_networks(),
                     "proxyTokenRequired": bool(PROXY_TOKEN),
                     "robots": env_flag("TUS_ROBOT_AUTORUN"),
                     "google": google.status(),
-                    "version": 2,
+                    "oauth": oauth.overview(self._public_base()),
+                    "redirectUri": oauth.redirect_uri(self._public_base()),
+                    "version": 3,
                 })
+                return
+            if path == "/api/oauth/providers":
+                import oauth
+                self._send({"ok": True, "providers": oauth.overview(self._public_base()),
+                            "redirectUri": oauth.redirect_uri(self._public_base())})
+                return
+            if path == "/api/oauth/auth-url":
+                import oauth
+                self._send(oauth.auth_url((query.get("provider") or [""])[0], self._public_base()))
                 return
             if path == "/api/robots":
                 import robots
@@ -378,6 +437,23 @@ class Handler(BaseHTTPRequestHandler):
                 import google
                 self._send(google.auth_url())
                 return
+            if path == "/api/oauth/callback":
+                import oauth
+                provider = (query.get("provider") or [""])[0]
+                code = (query.get("code") or [""])[0]
+                state = (query.get("state") or [""])[0]
+                error = (query.get("error") or [""])[0]
+                if error or not code:
+                    message = str(query.get("error_description") or [error or "Code d’autorisation absent."])[0]
+                    self._html(oauth.callback_html(False, provider, message))
+                else:
+                    try:
+                        label = oauth.exchange(provider, code, state, self._public_base())
+                        self._html(oauth.callback_html(True, provider,
+                                   "Connexion réussie : " + str(label) + ". Vous pouvez fermer cette fenêtre."))
+                    except Exception as e:
+                        self._html(oauth.callback_html(False, provider, str(e)[:300]))
+                return
             if path == "/api/google/callback":
                 import google
                 code = (query.get("code") or [""])[0]
@@ -399,6 +475,25 @@ class Handler(BaseHTTPRequestHandler):
                 import google
                 self._send({"ok": True, "data": google.download((query.get("id") or [""])[0])})
                 return
+            if path == "/api/messages/config":
+                import messages
+                self._send(messages.config())
+                return
+            if path == "/api/messages":
+                import messages
+                thread = (query.get("thread") or [""])[0]
+                token = (query.get("token") or [""])[0]
+                admin = self._is_admin() and bool(PROXY_TOKEN)
+                if not admin and token != thread:
+                    raise ValueError("Jeton de conversation invalide.")
+                self._send(messages.listing(None if admin else thread,
+                                            (query.get("since") or [None])[0], admin))
+                return
+            if path.startswith("/api/messages/file/"):
+                import messages
+                mime, content = messages.attachment(path.rsplit("/", 1)[-1])
+                self._bytes(content, mime)
+                return
             self._send({"ok": False, "error": "Introuvable"}, 404)
         except (ValueError, KeyError, RuntimeError) as e:
             self._send({"ok": False, "error": str(e)[:600]}, 400)
@@ -406,12 +501,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send({"ok": False, "error": "Erreur interne : " + type(e).__name__ + " : " + str(e)[:300]}, 500)
 
     def do_POST(self):
-        if not self._authorized():
-            return
         path = self.path.split("?")[0]
+        public_posts = ("/api/messages", "/api/messages/subscribe")
+        if path not in public_posts and not self._authorized():
+            return
         try:
             length = int(self.headers.get("Content-Length") or 0)
-            data = json.loads(self.rfile.read(length).decode("utf-8") or "{}") if length else {}
+            raw = self.rfile.read(length).decode("utf-8-sig").lstrip("\ufeff") or "{}"
+            data = json.loads(raw) if length else {}
             if path == "/api/ai":
                 self._send(run_ai(data))
                 return
@@ -440,6 +537,14 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     vault.set("secrets", SECRET_KEYS[name], value)
                 self._send({"ok": True, "ai": configured_providers(), "social": configured_networks()})
+                return
+            if path == "/api/oauth/disconnect":
+                import oauth
+                provider = str(data.get("provider") or "").strip()
+                if provider not in oauth.PROVIDERS:
+                    raise ValueError("Réseau inconnu : " + provider)
+                oauth.disconnect(provider)
+                self._send({"ok": True, "provider": provider, "social": configured_networks()})
                 return
             if path == "/api/pipeline/run":
                 import pipeline
@@ -484,6 +589,18 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/google/restore":
                 import google
                 self._send({"ok": True, "data": google.download(str(data.get("id") or ""))})
+                return
+            if path == "/api/messages":
+                import messages
+                payload = dict(data)
+                payload["admin"] = bool(data.get("admin")) and self._is_admin()
+                self._send(messages.post(payload))
+                return
+            if path == "/api/messages/subscribe":
+                import messages
+                payload = dict(data)
+                payload["role"] = "admin" if (data.get("role") == "admin" and self._is_admin()) else "client"
+                self._send(messages.subscribe(payload))
                 return
             self._send({"ok": False, "error": "Introuvable"}, 404)
         except (ValueError, KeyError, RuntimeError) as e:
