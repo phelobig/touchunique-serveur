@@ -1,0 +1,6 @@
+# Secrets locaux du serveur : jamais versionnés.
+.vault_key
+vault.json
+data/
+__pycache__/
+*.pyc
