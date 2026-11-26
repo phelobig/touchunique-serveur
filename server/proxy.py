@@ -175,7 +175,11 @@ def configured_networks():
 
 def http_json(url, payload=None, headers=None, method=None):
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
-    hdrs = {"Content-Type": "application/json", "Accept": "application/json"}
+    hdrs = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "TouchUniqueStudio/3.2 (+https://phelobig.github.io/touchunique-site/)"
+    }
     if headers:
         hdrs.update(headers)
     req = urllib.request.Request(url, data=data, headers=hdrs, method=method or ("POST" if data else "GET"))
@@ -320,7 +324,21 @@ def call_web(prompt, system, max_tokens):
         "messages": messages,
         "max_tokens": max_tokens,
     }
-    _, body = http_json("https://text.pollinations.ai/openai", payload)
+    try:
+        _, body = http_json("https://text.pollinations.ai/openai", payload)
+    except Exception as first_error:
+        if not context:
+            raise
+        # Certains services publics refusent ponctuellement une consigne longue :
+        # on retente sans le contexte Wikipédia plutôt que de couper l'IA.
+        try:
+            retry = dict(payload)
+            retry["messages"] = ([{"role": "system", "content": str(system or "")[:3500]}] if system else []) + [
+                {"role": "user", "content": prompt}
+            ]
+            _, body = http_json("https://text.pollinations.ai/openai", retry)
+        except Exception:
+            raise first_error
     choices = body.get("choices") or []
     text = ""
     if choices:
@@ -576,7 +594,7 @@ class Handler(BaseHTTPRequestHandler):
                     "ai": configured_providers(),
                     "social": configured_networks(),
                     "messages": {"ok": True, "enabled": messages.config()["enabled"]},
-                    "version": 5,
+                    "version": 6,
                 }
                 if self._is_admin():
                     import google, oauth
