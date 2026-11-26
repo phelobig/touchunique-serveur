@@ -2,6 +2,9 @@
 
 Proxy gratuit déployé sur Render : IA, réseaux sociaux, Google Drive, OAuth, fichiers et messagerie site ↔ application. Les secrets restent sur le serveur dans `vault.json` chiffré (`TUS_VAULT_KEY`) ou dans les variables d’environnement. Aucune clé n’est envoyée au navigateur.
 
+**URL publique :** `https://touchunique-serveur.onrender.com`  
+Le site `https://phelobig.github.io/touchunique-site/?v=18` est préconnecté à cette URL : l’envoi d’un message ne demande aucun jeton au visiteur. L’application administrateur utilise la même URL avec la clé `X-Tus-Key` saisie dans ses réglages.
+
 ## Démarrage
 
 ```bash
@@ -14,7 +17,8 @@ Variables :
 - `TUS_VAULT_KEY` : clé du coffre chiffré (générée automatiquement par Render).
 - `TUS_PROXY_TOKEN` : clé partagée `X-Tus-Key` pour les appels administrateur (IA, fichiers, réponses messagerie, publication). Les visiteurs du site n’en ont pas besoin.
 - `ALLOWED_ORIGINS` : origines autorisées, séparées par des virgules.
-- `TUS_GOOGLE_REDIRECT_URI`, `TUS_OAUTH_REDIRECT_URI` : callbacks HTTPS à déclarer chez les fournisseurs.
+- `GOOGLE_REDIRECT_URI` : callback Google (`https://touchunique-serveur.onrender.com/api/google/callback`).
+- `PUBLIC_BASE_URL` : base HTTPS publique utilisée pour tous les callbacks OAuth (`oauth.redirect_uri` est calculé depuis cette valeur).
 
 ## Messagerie site ↔ application
 
