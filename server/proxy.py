@@ -3,17 +3,27 @@
 Touch Unique Studio — proxy sécurisé pour IA, réseaux sociaux et Google Drive.
 
 Les clés API et les tokens sociaux ne sont JAMAIS envoyés au navigateur :
-ils sont lus dans le coffre chiffré du serveur ou ses variables d'environnement.
-L'application Windows (Electron) est autorisée en plus des origines HTTPS.
+ils sont lus dans le coffre chiffré du serveur, dans un fichier privé local
+(voir envloader.py) ou dans les variables d'environnement. Aucune valeur de
+secret n'est journalisée ni renvoyée par une route.
+
+L'IA est gratuite et illimitée pour tous : fournisseur public sans clé en
+priorité, puis repli configurables. Une limite technique large (120 req/min/IP)
+protège seulement contre les abus ; il n'existe aucun « essai » ni quota.
+Les réponses sont bilingues FR/EN (server/language.py).
 
 Démarrage :
     python server/proxy.py
 
 Variables d'environnement :
+    TUS_PRIVATE_ENV       chemin d'un fichier privé CLE=valeur (chargé en premier)
+    TUS_DEFAULT_LANG      langue par défaut quand rien n'est détecté (fr|en)
+    AI_RATE_LIMIT_PER_MIN limite technique IA, au moins 120 requêtes/min/IP
     TUS_PROXY_TOKEN       (optionnel) clé partagée envoyée dans X-Tus-Key
     ALLOWED_ORIGIN        origine autorisée (défaut : https://phelobig.github.io)
     OPENAI_API_KEY        clé OpenAI
     OPENAI_MODEL          (défaut : gpt-4o-mini)
+    OPENAI_BASE_URL       base compatible OpenAI (défaut : https://api.openai.com/v1)
     GEMINI_API_KEY        clé Google Gemini
     GEMINI_MODEL          (défaut : gemini-1.5-flash)
     ANTHROPIC_API_KEY     clé Anthropic
@@ -34,7 +44,7 @@ Variables d'environnement :
 Endpoints :
     GET  /api/status, /api/visits, /api/robots, /api/agents, /api/catalog, /api/files
     GET  /api/google/callback, /api/oauth/callback  (callbacks publics OAuth)
-    POST /api/ai, /api/publish, /api/robots/run
+    POST /api/ai (corps : prompt, system?, lang?, provider?, maxTokens?), /api/publish, /api/robots/run
     POST /api/credentials, /api/catalog  (catalogue synchronisé prix/images)
     POST /api/agents, /api/pipeline/run, /api/files/upload
     POST /api/media/analyze, /api/media/mission  (analyse multimédia par IA)
@@ -60,6 +70,16 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# Tout secret local est chargé avant la première lecture d'une variable
+# d'environnement. envloader ne journalise jamais de valeur.
+try:
+    import envloader
+    envloader.load()
+except Exception:
+    pass
+
+import language
 
 ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "https://phelobig.github.io").rstrip("/")
 ALLOWED_ORIGINS = {
@@ -92,26 +112,18 @@ def cached(key, producer, ttl=30):
 
 IP_RATE = {}
 IP_RATE_LOCK = threading.Lock()
-AI_QUOTA = {}
-AI_QUOTA_LIMIT = 2
+# Limite technique uniquement (aucune notion d'essai ou de quota) : au moins
+# 120 requêtes IA par minute et par adresse IP.
+try:
+    AI_RATE_LIMIT = max(120, int(os.environ.get("AI_RATE_LIMIT_PER_MIN") or 120))
+except (TypeError, ValueError):
+    AI_RATE_LIMIT = 120
+AI_RATE_WINDOW = 60
 
 
-def ai_quota_ok(ip, admin=False):
-    """Deux essais IA distants par jour et par visiteur, appliqués côté serveur."""
-    if admin:
-        return True
-    day = time.strftime("%Y-%m-%d")
-    now = time.monotonic()
-    with IP_RATE_LOCK:
-        for key, value in list(AI_QUOTA.items()):
-            if value[0] != day or now - value[2] > 86400:
-                AI_QUOTA.pop(key, None)
-        entry = AI_QUOTA.get(ip, (day, 0, now))
-        if entry[1] >= AI_QUOTA_LIMIT:
-            AI_QUOTA[ip] = entry
-            return False
-        AI_QUOTA[ip] = (day, entry[1] + 1, now)
-        return True
+def ai_rate_ok(ip):
+    """Protection technique très large contre les abus, sans quota ni essai."""
+    return messages_rate_ok(ip, "/api/ai", limit=AI_RATE_LIMIT, window=AI_RATE_WINDOW)
 
 
 def messages_rate_ok(ip, path, limit=120, window=600):
@@ -133,12 +145,15 @@ def messages_rate_ok(ip, path, limit=120, window=600):
 def now_iso():
     return datetime.now().isoformat(timespec="seconds")
 
+OPENAI_BASE_URL = (os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
+
+# Les valeurs vides de render.yaml signifient « défaut », pas « modèle vide ».
 MODELS = {
-    "openai": os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
-    "gemini": os.environ.get("GEMINI_MODEL", "gemini-1.5-flash"),
-    "anthropic": os.environ.get("ANTHROPIC_MODEL", "claude-3-5-haiku-latest"),
-    "perplexity": os.environ.get("PERPLEXITY_MODEL", "sonar"),
-    "web": os.environ.get("POLLINATIONS_MODEL", "openai"),
+    "openai": os.environ.get("OPENAI_MODEL") or "gpt-4o-mini",
+    "gemini": os.environ.get("GEMINI_MODEL") or "gemini-1.5-flash",
+    "anthropic": os.environ.get("ANTHROPIC_MODEL") or "claude-3-5-haiku-latest",
+    "perplexity": os.environ.get("PERPLEXITY_MODEL") or "sonar",
+    "web": os.environ.get("POLLINATIONS_MODEL") or "openai",
 }
 
 
@@ -173,12 +188,19 @@ def configured_networks():
     return cached("networks", build)
 
 
+def error_kind(error):
+    """Nature d'une erreur sans son message : les messages peuvent contenir des secrets."""
+    if isinstance(error, urllib.error.HTTPError):
+        return "HTTP " + str(error.code)
+    return type(error).__name__
+
+
 def http_json(url, payload=None, headers=None, method=None):
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     hdrs = {
         "Content-Type": "application/json",
         "Accept": "application/json",
-        "User-Agent": "TouchUniqueStudio/3.2 (+https://phelobig.github.io/touchunique-site/)"
+        "User-Agent": "TouchUniqueStudio/7.0 (+https://phelobig.github.io/touchunique-site/; contact: https://wa.me/22655041530)"
     }
     if headers:
         hdrs.update(headers)
@@ -188,10 +210,9 @@ def http_json(url, payload=None, headers=None, method=None):
             raw = resp.read().decode("utf-8", "replace")
             return resp.status, json.loads(raw) if raw else {}
     except urllib.error.HTTPError as e:
-        # Le corps d'une erreur upstream peut contenir des secrets ou du HTML :
-        # il est journalisé côté serveur, jamais renvoyé au navigateur.
-        raw = e.read().decode("utf-8", "replace")[:1000]
-        print("HTTP amont %s : %s" % (e.code, raw.replace("\n", " ")[:300]), file=sys.stderr, flush=True)
+        # Le corps d'une erreur amont peut contenir des secrets : il n'est ni
+        # journalisé ni renvoyé. Seul le code HTTP est conservé.
+        print("HTTP amont :", error_kind(e), file=sys.stderr, flush=True)
         raise RuntimeError("Service distant indisponible (HTTP %s)" % e.code) from e
 
 
@@ -210,7 +231,7 @@ def call_openai(prompt, system, max_tokens):
         ],
     }
     _, body = http_json(
-        "https://api.openai.com/v1/chat/completions",
+        OPENAI_BASE_URL + "/chat/completions",
         payload,
         {"Authorization": "Bearer " + key},
     )
@@ -274,21 +295,26 @@ def call_perplexity(prompt, system, max_tokens):
     return text, MODELS["perplexity"]
 
 
-def web_context(prompt):
+def web_context(prompt, lang="fr"):
     """Contexte public réel, récupéré côté serveur sans clé ni secret.
 
-    Wikipédia est utilisé comme source ouverte et vérifiable. Les extraits sont
-    courts et injectés dans la consigne : le modèle reste libre de répondre
-    avec ses propres connaissances si la recherche ne donne rien.
+    L'API Wikipédia de la langue détectée est utilisée comme source ouverte et
+    vérifiable (fr.wikipedia.org ou en.wikipedia.org), avec un User-Agent
+    explicite. Trois sources avec URL réelle sont conservées au maximum.
     """
+    code = language.normalize_lang(lang)
     terms = re.findall(r"[A-Za-zÀ-ÿ0-9]{4,}", str(prompt or ""))[:8]
     if not terms:
         return "", []
     query = urllib.parse.quote_plus(" ".join(terms))
-    url = ("https://fr.wikipedia.org/w/api.php?action=query&list=search&srsearch="
+    host = "fr.wikipedia.org" if code == "fr" else "en.wikipedia.org"
+    url = ("https://" + host + "/w/api.php?action=query&list=search&srsearch="
            + query + "&format=json&srlimit=3")
     try:
-        _, body = http_json(url, None, {"Accept": "application/json"}, method="GET")
+        _, body = http_json(url, None, {
+            "Accept": "application/json",
+            "User-Agent": "TouchUniqueStudio/7.0-assistant (+https://phelobig.github.io/touchunique-site/)",
+        }, method="GET")
         items = (body.get("query") or {}).get("search") or []
     except Exception:
         return "", []
@@ -302,19 +328,21 @@ def web_context(prompt):
             lines.append("- " + title[:80] + " : " + snippet[:240])
             sources.append({
                 "title": title[:80],
-                "url": "https://fr.wikipedia.org/wiki/" + urllib.parse.quote(title.replace(" ", "_"))
+                "url": "https://" + host + "/wiki/" + urllib.parse.quote(title.replace(" ", "_"))
             })
     if not lines:
         return "", []
-    return "\n\nContexte Internet vérifié (Wikipédia) :\n" + "\n".join(lines), sources
+    intro = language.phrase("context_intro", code)
+    return "\n\n" + intro + "\n" + "\n".join(lines), sources
 
 
-def call_web(prompt, system, max_tokens):
-    """IA en ligne sans clé : accès Internet permanent pour site et application."""
-    context, sources = web_context(prompt)
+def call_web(prompt, system, max_tokens, lang="fr"):
+    """IA en ligne sans clé : accès Internet gratuit et illimité, FR/EN."""
+    code = language.normalize_lang(lang)
+    context, sources = web_context(prompt, code)
     base = str(system or "").strip()
     if context:
-        base = (base + "\n" if base else "") + "Utilise le contexte suivant s'il est utile, en restant exact." + context
+        base = (base + "\n" if base else "") + language.phrase("context_use", code) + "\n" + context
     messages = []
     if base:
         messages.append({"role": "system", "content": base[:3500]})
@@ -352,44 +380,53 @@ def run_ai(data):
     prompt = str(data.get("prompt") or "").strip()
     if not prompt:
         raise ValueError("Prompt vide")
-    system = str(data.get("system") or "")[:2000]
+    # Langue fournie par le client ou détectée depuis le prompt et la consigne.
+    raw_lang = str(data.get("lang") or "").strip()
+    client_system = str(data.get("system") or "")[:2000]
+    lang = (language.normalize_lang(raw_lang) if raw_lang
+            else language.detect(prompt + "\n" + client_system))
+    system = language.system(client_system, lang)
     max_tokens = min(max(int(data.get("maxTokens") or 900), 64), 4096)
     provider = str(data.get("provider") or "auto").lower()
     providers = configured_providers()
 
+    def web_call(p, s, m):
+        return call_web(p, s, m, lang)
+
     funcs = {"openai": call_openai, "gemini": call_gemini,
              "anthropic": call_anthropic, "perplexity": call_perplexity,
-             "web": call_web}
+             "web": web_call}
+
+    def result_of(name, result):
+        if name == "web" and len(result) == 3:
+            text, model, sources = result
+            return {"ok": True, "provider": name, "model": model,
+                    "text": text, "sources": sources, "lang": lang}
+        text, model = result
+        return {"ok": True, "provider": name, "model": model,
+                "text": text, "sources": [], "lang": lang}
+
     if provider == "auto":
         # Le fournisseur Web public est essayé en premier : accès Internet
-        # permanent, sans clé et sans quota. Les fournisseurs avec clé servent
-        # de repli si le service public est momentanément indisponible.
+        # permanent, sans clé, sans quota et sans essai. Les fournisseurs avec
+        # clé servent de repli si le service public est indisponible.
         errors = []
         for name in ("web", "perplexity", "openai", "gemini", "anthropic"):
             if not providers.get(name):
                 continue
             try:
-                result = funcs[name](prompt, system, max_tokens)
-                if name == "web" and len(result) == 3:
-                    text, model, sources = result
-                    return {"ok": True, "provider": name, "model": model,
-                            "text": text, "sources": sources}
-                text, model = result
-                return {"ok": True, "provider": name, "model": model, "text": text}
+                return result_of(name, funcs[name](prompt, system, max_tokens))
             except Exception as e:
-                print("IA %s indisponible : %s" % (name, str(e)[:180]), file=sys.stderr, flush=True)
+                print("IA %s indisponible : %s" % (name, error_kind(e)), file=sys.stderr, flush=True)
                 errors.append(name)
-        raise RuntimeError("Aucun fournisseur IA disponible (" + ", ".join(errors) + ")")
+        # Aucun service distant : réponse locale honnête, jamais une invention.
+        return {"ok": True, "provider": "local", "model": "reponse-locale",
+                "text": language.reply(prompt, lang, {"available": False}),
+                "sources": [], "lang": lang, "live": False}
 
     if provider not in providers or not providers.get(provider):
         raise ValueError("Fournisseur IA non connecté : " + provider)
-    result = funcs[provider](prompt, system, max_tokens)
-    if provider == "web" and len(result) == 3:
-        text, model, sources = result
-        return {"ok": True, "provider": provider, "model": model,
-                "text": text, "sources": sources}
-    text, model = result
-    return {"ok": True, "provider": provider, "model": model, "text": text}
+    return result_of(provider, funcs[provider](prompt, system, max_tokens))
 
 
 def run_publish(data):
@@ -465,17 +502,25 @@ def run_publish(data):
     raise ValueError("Réseau non pris en charge : " + network)
 
 
+# Noms d'identifiants acceptés par /api/credentials -> clés du coffre.
+# Uniquement des noms : aucune valeur de secret n'est exposée ni journalisée.
 SECRET_KEYS = {
-    "openai": "openai_api_key", "gemini": "gemini_api_key",
-    "anthropic": "anthropic_api_key", "perplexity": "perplexity_api_key",
-    "facebook": "facebook_token", "facebook_page": "facebook_page",
+    "openai": "openai_api_key", "openai_api_key": "openai_api_key",
+    "gemini": "gemini_api_key", "gemini_api_key": "gemini_api_key",
+    "anthropic": "anthropic_api_key", "anthropic_api_key": "anthropic_api_key",
+    "perplexity": "perplexity_api_key", "perplexity_api_key": "perplexity_api_key",
+    "facebook": "facebook_token", "facebook_token": "facebook_token",
+    "facebook_page": "facebook_page", "facebook_page_id": "facebook_page",
     "facebook_app_id": "facebook_app_id", "facebook_app_secret": "facebook_app_secret",
-    "instagram": "instagram_token", "instagram_user": "instagram_user",
+    "instagram": "instagram_token", "instagram_token": "instagram_token",
+    "instagram_user": "instagram_user", "instagram_user_id": "instagram_user",
     "instagram_app_id": "instagram_app_id", "instagram_app_secret": "instagram_app_secret",
-    "linkedin": "linkedin_token", "linkedin_org": "linkedin_org",
-    "linkedin_person": "linkedin_person",
+    "linkedin": "linkedin_token", "linkedin_token": "linkedin_token",
+    "linkedin_org": "linkedin_org", "linkedin_org_id": "linkedin_org",
+    "linkedin_person": "linkedin_person", "linkedin_person_id": "linkedin_person",
     "linkedin_client_id": "linkedin_client_id", "linkedin_client_secret": "linkedin_client_secret",
-    "x": "x_token", "x_user": "x_user",
+    "x": "x_token", "x_token": "x_token", "x_access_token": "x_token",
+    "x_user": "x_user", "x_user_id": "x_user",
     "x_client_id": "x_client_id", "x_client_secret": "x_client_secret",
     "google_client_id": "google_client_id", "google_client_secret": "google_client_secret",
     "google_redirect_uri": "google_redirect_uri",
@@ -483,7 +528,7 @@ SECRET_KEYS = {
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "TouchUniqueProxy/3.0"
+    server_version = "TouchUniqueProxy/7.0"
 
     def setup(self):
         super().setup()
@@ -593,8 +638,9 @@ class Handler(BaseHTTPRequestHandler):
                     "configured": True,
                     "ai": configured_providers(),
                     "social": configured_networks(),
+                    "langues": language.languages(),
                     "messages": {"ok": True, "enabled": messages.config()["enabled"]},
-                    "version": 6,
+                    "version": 7,
                 }
                 if self._is_admin():
                     import google, oauth
@@ -687,7 +733,7 @@ class Handler(BaseHTTPRequestHandler):
                                    "Connexion réussie : " + str(label) + ". Vous pouvez fermer cette fenêtre.",
                                    return_origin, return_nonce))
                     except Exception as e:
-                        print("OAuth :", type(e).__name__, str(e)[:200], file=sys.stderr, flush=True)
+                        print("OAuth :", error_kind(e), file=sys.stderr, flush=True)
                         self._html(oauth.callback_html(False, provider, "Connexion impossible, recommencez.",
                                                        return_origin, return_nonce))
                 return
@@ -708,7 +754,7 @@ class Handler(BaseHTTPRequestHandler):
                                    "Votre Google Drive est connecté. Vous pouvez fermer cette fenêtre.",
                                    return_origin, return_nonce))
                     except Exception as e:
-                        print("Google :", type(e).__name__, str(e)[:200], file=sys.stderr, flush=True)
+                        print("Google :", error_kind(e), file=sys.stderr, flush=True)
                         self._html(google.callback_html(False, "Connexion impossible, recommencez.",
                                                          return_origin, return_nonce))
                 return
@@ -749,14 +795,17 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send({"ok": False, "error": "Introuvable"}, 404)
         except (ValueError, KeyError) as e:
+            # Les erreurs de validation sont sans secret ; les erreurs inattendues
+            # sont réduites à leur nature (jamais leur message).
             self._send({"ok": False, "error": str(e)[:300]}, 400)
         except Exception as e:
-            print("Erreur GET :", type(e).__name__, str(e)[:300], file=sys.stderr, flush=True)
+            print("Erreur GET :", error_kind(e), file=sys.stderr, flush=True)
             self._send({"ok": False, "error": "Erreur interne du serveur."}, 500)
 
     def do_POST(self):
         path = self.path.split("?")[0]
-        # L'essai IA du visiteur reste public ; le quota est appliqué côté serveur.
+        # L'IA est publique, gratuite et illimitée ; seule une limite technique
+        # très large est appliquée à /api/ai (voir ai_rate_ok).
         public_posts = ("/api/messages", "/api/messages/subscribe", "/api/ai", "/api/visits")
         if path not in public_posts and not self._authorized():
             return
@@ -769,16 +818,16 @@ class Handler(BaseHTTPRequestHandler):
             data = json.loads(raw) if length else {}
             if not isinstance(data, dict):
                 raise ValueError("Requête invalide.")
-            if path in public_posts and not messages_rate_ok(self._client_ip(), path):
+            if path in public_posts and path != "/api/ai" and not messages_rate_ok(self._client_ip(), path):
                 self._send({"ok": False, "error": "Trop de requêtes. Réessayez dans quelques minutes."}, 429)
                 return
             if path == "/api/ai":
-                wanted = str(data.get("provider") or "auto").lower()
-                available = configured_providers()
-                # Le fournisseur Web est public et sans clé : pas de quota pour lui.
-                free_web = wanted == "web" or (wanted == "auto" and available.get("web"))
-                if not free_web and not ai_quota_ok(self._client_ip(), self._is_admin()):
-                    raise ValueError("Vos 2 essais IA gratuits du jour sont utilisés. Demandez un accès complet sur WhatsApp.")
+                if not ai_rate_ok(self._client_ip()):
+                    lang = language.normalize_lang(data.get("lang")) if data.get("lang") else language.detect(
+                        str(data.get("prompt") or "") + "\n" + str(data.get("system") or ""))
+                    self._send({"ok": False, "error": language.phrase("rate_limit", lang, limit=AI_RATE_LIMIT),
+                                "lang": lang}, 429)
+                    return
                 self._send(run_ai(data))
                 return
             if path == "/api/publish":
@@ -883,10 +932,10 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, KeyError) as e:
             self._send({"ok": False, "error": str(e)[:300]}, 400)
         except RuntimeError as e:
-            print("Erreur amont :", str(e)[:300], file=sys.stderr, flush=True)
+            print("Erreur amont :", error_kind(e), file=sys.stderr, flush=True)
             self._send({"ok": False, "error": "Service distant indisponible."}, 502)
         except Exception as e:  # pragma: no cover
-            print("Erreur POST :", type(e).__name__, str(e)[:300], file=sys.stderr, flush=True)
+            print("Erreur POST :", error_kind(e), file=sys.stderr, flush=True)
             self._send({"ok": False, "error": "Erreur interne du serveur."}, 500)
 
 
@@ -907,7 +956,7 @@ def robot_scheduler():
                 robots.write_state(state)
                 print("Robots :", [(r.get("id"), r.get("ok"), r.get("result", "")) for r in results], flush=True)
         except Exception as e:
-            print("Robots : erreur", type(e).__name__, str(e)[:200], flush=True)
+            print("Robots : erreur", error_kind(e), flush=True)
         time.sleep(60)
 
 
@@ -928,6 +977,7 @@ def main():
     server = Server((host, port), Handler)
     print("Proxy Touch Unique sur http://%s:%s" % (host, port), flush=True)
     print("IA :", configured_providers(), flush=True)
+    print("Langues :", ", ".join(language.languages()), flush=True)
     print("Réseaux :", configured_networks(), flush=True)
     import messages
     print("Web Push :", "activé" if messages.ensure_keys() else "désactivé", flush=True)

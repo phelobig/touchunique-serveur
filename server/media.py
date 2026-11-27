@@ -9,6 +9,8 @@ directement le pipeline collaboratif des quatre agents.
 
 Aucune donnée n'est envoyée à un service qui n'a pas été connecté dans les
 réglages : le fournisseur est choisi parmi les clés présentes dans le coffre.
+La consigne système est bilingue (FR par défaut, EN si détecté) et impose
+l'extraction strictement réelle ainsi qu'un JSON valide.
 """
 
 import base64
@@ -22,6 +24,7 @@ from datetime import date
 from pathlib import Path
 
 import files
+import language
 import proxy
 
 BASE = Path(__file__).resolve().parent
@@ -35,24 +38,19 @@ DOC_TYPES = {"application/pdf", "text/plain", "text/markdown", "text/csv", "text
 
 MAX_BYTES = 20 * 1024 * 1024  # limite d'inline Gemini, cohérente avec l'upload (12 Mo)
 
-SYSTEM_PROMPT = (
-    "Tu es l'analyste multimédia de Touch Unique Studio au Burkina-Faso. "
-    "Tu examines le fichier fourni avec précision et neutralité. "
-    "Tu extrais uniquement ce qui est réellement visible ou audible, sans inventer. "
-    "Tu signales explicitement ce qui est illisible, ambigu ou non vérifiable. "
-    "Réponds en français, sous forme de JSON valide avec les clés : "
-    "summary (2 phrases), details (liste de faits observés), "
-    "entities (objet avec names, organisations, phones, emails, dates, amounts, urls — listes), "
-    "suggestedMission (une phrase d'objectif actionnable pour le studio), "
-    "confidence (élevée/moyenne/faible)."
-)
+def system_prompt(lang="fr"):
+    """Consigne stricte bilingue : faits réels uniquement, JSON valide."""
+    return language.phrase("media_system", lang)
 
-FALLBACK_SYSTEM = (
-    "Tu es l'analyste multimédia de Touch Unique Studio. Décris précisément le fichier, "
-    "extrais les informations utiles (noms, contacts, dates, montants, besoins) et propose "
-    "une mission de création ou de prospection. Ne prétends jamais avoir contacté quelqu'un. "
-    "Réponds en français avec des titres clairs."
-)
+
+def fallback_system(lang="fr"):
+    """Consigne de structuration bilingue, sans invention."""
+    return language.phrase("media_fallback", lang)
+
+
+# Constantes conservées pour compatibilité avec les anciens imports.
+SYSTEM_PROMPT = system_prompt("fr")
+FALLBACK_SYSTEM = fallback_system("fr")
 
 
 def kind_of(mime="", name=""):
@@ -100,7 +98,7 @@ def _json_from_text(text):
     return None
 
 
-def _normalize(parsed, fallback_text):
+def _normalize(parsed, fallback_text, lang="fr"):
     """Garantit une forme stable, quel que soit le fournisseur."""
     if not isinstance(parsed, dict):
         parsed = {}
@@ -122,26 +120,24 @@ def _normalize(parsed, fallback_text):
         "details": [str(d)[:400] for d in details[:25]],
         "entities": clean_entities,
         "suggestedMission": str(parsed.get("suggestedMission") or parsed.get("mission") or "")[:800],
-        "confidence": str(parsed.get("confidence") or "non précisée")[:40],
+        "confidence": str(parsed.get("confidence") or language.phrase("media_not_specified", lang))[:40],
         "raw": fallback_text[:30000],
     }
 
 
-def _question_prompt(question, kind):
-    base = (
-        "Analyse ce fichier " + kind + " pour une mission de Touch Unique Studio. "
-        "Extrais toutes les informations exploitables et réponds en JSON selon la consigne."
-    )
+def _question_prompt(question, kind, lang="fr"):
+    base = language.phrase("media_question", lang, kind=kind)
     if question:
-        base += "\n\nQuestion précise de l'utilisateur : " + str(question)[:1200]
+        label = "Question précise de l'utilisateur :" if language.normalize_lang(lang) == "fr" else "Specific user question:"
+        base += "\n\n" + label + " " + str(question)[:1200]
     return base
 
 
-def _gemini_multimodal(data_b64, mime, kind, question, max_tokens=2200):
+def _gemini_multimodal(data_b64, mime, kind, question, max_tokens=2200, lang="fr"):
     key = proxy._secret("gemini_api_key", "GEMINI_API_KEY")
     model = os.environ.get("GEMINI_VISION_MODEL", "gemini-1.5-flash")
     parts = [
-        {"text": SYSTEM_PROMPT + "\n\n" + _question_prompt(question, kind)},
+        {"text": system_prompt(lang) + "\n\n" + _question_prompt(question, kind, lang)},
         {"inline_data": {"mime_type": mime or "application/octet-stream", "data": data_b64}},
     ]
     url = ("https://generativelanguage.googleapis.com/v1beta/models/" + model +
@@ -157,16 +153,16 @@ def _gemini_multimodal(data_b64, mime, kind, question, max_tokens=2200):
     return text, model
 
 
-def _openai_vision(data_b64, mime, question, max_tokens=2200):
+def _openai_vision(data_b64, mime, question, max_tokens=2200, lang="fr"):
     key = proxy._secret("openai_api_key", "OPENAI_API_KEY")
     model = os.environ.get("OPENAI_VISION_MODEL", "gpt-4o-mini")
     payload = {
         "model": model,
         "max_tokens": max_tokens,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt(lang)},
             {"role": "user", "content": [
-                {"type": "text", "text": _question_prompt(question, "image")},
+                {"type": "text", "text": _question_prompt(question, "image", lang)},
                 {"type": "image_url", "image_url": {"url": "data:" + (mime or "image/png") + ";base64," + data_b64}},
             ]},
         ],
@@ -199,23 +195,25 @@ def _openai_transcribe(raw, name, mime):
         with urllib.request.urlopen(req, timeout=120) as resp:
             parsed = json.loads(resp.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as e:
-        raise RuntimeError("Transcription impossible : HTTP " + str(e.code) + " " + e.read().decode("utf-8", "replace")[:300])
+        # Le corps d'une erreur amont peut contenir des secrets : jamais lu,
+        # jamais journalisé, jamais renvoyé.
+        raise RuntimeError("Transcription impossible : HTTP " + str(e.code))
     text = parsed.get("text") or ""
     segments = parsed.get("segments") or []
     details = [str(s.get("text", ""))[:400] for s in segments[:25] if s.get("text")]
     return text, details
 
 
-def _anthropic_vision(data_b64, mime, question, max_tokens=2200):
+def _anthropic_vision(data_b64, mime, question, max_tokens=2200, lang="fr"):
     key = proxy._secret("anthropic_api_key", "ANTHROPIC_API_KEY")
     model = os.environ.get("ANTHROPIC_VISION_MODEL", "claude-3-5-haiku-latest")
     payload = {
         "model": model,
         "max_tokens": max_tokens,
-        "system": SYSTEM_PROMPT,
+        "system": system_prompt(lang),
         "messages": [{"role": "user", "content": [
             {"type": "image", "source": {"type": "base64", "media_type": mime or "image/png", "data": data_b64}},
-            {"type": "text", "text": _question_prompt(question, "image")},
+            {"type": "text", "text": _question_prompt(question, "image", lang)},
         ]}],
     }
     _, body = proxy.http_json("https://api.anthropic.com/v1/messages", payload,
@@ -268,6 +266,8 @@ def analyze(payload):
     project = str(payload.get("project") or "").strip()[:120]
     folder = str(payload.get("folder") or "Médias").strip()[:80]
     question = str(payload.get("question") or "").strip()[:1200]
+    raw_lang = str(payload.get("lang") or "").strip()
+    lang = language.normalize_lang(raw_lang) if raw_lang else language.detect(question + "\n" + name)
     kind = kind_of(mime, name)
     providers = proxy.configured_providers()
     chosen = str(payload.get("provider") or "auto").lower()
@@ -292,16 +292,16 @@ def analyze(payload):
         if kind == "document":
             local = _local_document(raw, mime, name)
             engine = "local"
-            text = local or "Document binaire : aucun texte extractible localement."
-            details_override = ["Texte extrait localement : " + str(len(text)) + " caractères."]
+            text = local or language.phrase("media_binary", lang)
+            details_override = [language.phrase("media_local_extract", lang, count=len(text))]
             # Un document riche peut être complété par un IA texte.
             text_provider = pick("gemini", "openai", "anthropic", "perplexity")
             if text_provider and len(local) < 30000:
                 result = proxy.run_ai({
                     "provider": text_provider,
-                    "prompt": _question_prompt(question, "document") +
-                              "\n\nContenu du document :\n" + local[:18000],
-                    "system": SYSTEM_PROMPT, "maxTokens": 2200,
+                    "prompt": _question_prompt(question, "document", lang) +
+                              "\n\n" + language.phrase("media_document", lang) + "\n" + local[:18000],
+                    "system": system_prompt(lang), "lang": lang, "maxTokens": 2200,
                 })
                 text = result.get("text", "") or text
                 engine = text_provider
@@ -314,33 +314,37 @@ def analyze(payload):
                 if struct and text:
                     result = proxy.run_ai({
                         "provider": struct,
-                        "prompt": _question_prompt(question, "audio") + "\n\nTranscription :\n" + text[:15000],
-                        "system": SYSTEM_PROMPT, "maxTokens": 2200,
+                        "prompt": _question_prompt(question, "audio", lang) + "\n\n" +
+                                  language.phrase("media_transcript", lang) + "\n" + text[:15000],
+                        "system": system_prompt(lang), "lang": lang, "maxTokens": 2200,
                     })
                     text = result.get("text", "") or text
                     engine += "+" + struct
             else:
                 provider = pick("gemini")
                 if not provider:
-                    raise RuntimeError("Analyse audio impossible : connectez OpenAI (Whisper) ou Gemini.")
-                text, engine = _gemini_multimodal(content_b64, mime or "audio/mpeg", "audio", question)
+                    raise RuntimeError(language.phrase("media_no_audio", lang))
+                text, engine = _gemini_multimodal(content_b64, mime or "audio/mpeg", "audio", question,
+                                                  lang=lang)
         elif kind == "image":
             provider = pick("gemini", "openai", "anthropic")
             if not provider:
-                raise RuntimeError("Analyse d'image impossible : connectez Gemini, OpenAI ou Claude.")
+                raise RuntimeError(language.phrase("media_no_image", lang))
             if provider == "gemini":
-                text, engine = _gemini_multimodal(content_b64, mime or "image/png", "image", question)
+                text, engine = _gemini_multimodal(content_b64, mime or "image/png", "image", question,
+                                                  lang=lang)
             elif provider == "openai":
-                text, engine = _openai_vision(content_b64, mime or "image/png", question)
+                text, engine = _openai_vision(content_b64, mime or "image/png", question, lang=lang)
             else:
-                text, engine = _anthropic_vision(content_b64, mime or "image/png", question)
+                text, engine = _anthropic_vision(content_b64, mime or "image/png", question, lang=lang)
         elif kind == "video":
             provider = pick("gemini")
             if not provider:
-                raise RuntimeError("Analyse vidéo impossible : connectez Gemini (compréhension vidéo native).")
-            text, engine = _gemini_multimodal(content_b64, mime or "video/mp4", "vidéo", question)
+                raise RuntimeError(language.phrase("media_no_video", lang))
+            text, engine = _gemini_multimodal(
+                content_b64, mime or "video/mp4", "vidéo" if lang == "fr" else "video", question, lang=lang)
         else:
-            raise RuntimeError("Type de fichier non pris en charge pour l'analyse : " + (mime or name))
+            raise RuntimeError(language.phrase("media_no_type", lang, kind=mime or name))
 
         parsed = _json_from_text(text)
         if parsed is None:
@@ -350,26 +354,27 @@ def analyze(payload):
                 try:
                     result = proxy.run_ai({
                         "provider": struct,
-                        "prompt": "Transforme l'analyse suivante en JSON strict selon cette consigne :\n" +
-                                  SYSTEM_PROMPT + "\n\nAnalyse :\n" + text[:16000],
-                        "system": "Réponds uniquement avec un objet JSON valide.", "maxTokens": 1600,
+                        "prompt": language.phrase("media_json_task", lang) + "\n" +
+                                  system_prompt(lang) + "\n\nAnalyse :\n" + text[:16000],
+                        "system": language.phrase("media_json_only", lang),
+                        "lang": lang, "maxTokens": 1600,
                     })
                     parsed = _json_from_text(result.get("text", ""))
                 except Exception:
                     parsed = None
-        report = _normalize(parsed, text)
+        report = _normalize(parsed, text, lang)
         if details_override and not report["details"]:
             report["details"] = details_override
-        report["summary"] = report["summary"] or ("Fichier " + kind + " analysé : " + name)
+        report["summary"] = report["summary"] or language.phrase("media_summary", lang, kind=kind, name=name)
     except Exception as e:
-        report = _normalize(None, "")
-        report["summary"] = "Analyse indisponible : " + str(e)[:400]
+        report = _normalize(None, "", lang)
+        report["summary"] = language.phrase("media_error", lang, error=str(e)[:400])
         report["details"] = [str(e)[:400]]
-        report["confidence"] = "faible"
+        report["confidence"] = language.phrase("media_confidence", lang)
         report["error"] = str(e)[:500]
 
     report.update({
-        "ok": True, "kind": kind, "file": meta, "engine": engine,
+        "ok": True, "kind": kind, "file": meta, "engine": engine, "lang": lang,
         "name": name, "mime": mime, "company": company, "project": project,
         "analysedAt": proxy.now_iso(),
     })

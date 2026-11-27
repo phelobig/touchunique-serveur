@@ -18,18 +18,37 @@ services:
         value: "0"
       - key: TUS_ROBOT_PUBLISH
         value: "0"
+      - key: TUS_DEFAULT_LANG
+        value: fr
+      - key: AI_RATE_LIMIT_PER_MIN
+        value: "120"
       - key: HOST
         value: 0.0.0.0
       - key: PORT
         value: 8000
+      # IA : le fournisseur Web public fonctionne sans clé. Les clés ci-dessous
+      # ne sont que des replis optionnels, jamais des valeurs réelles.
       - key: OPENAI_API_KEY
+        value: ""
+      - key: OPENAI_BASE_URL
+        value: ""
+      - key: OPENAI_MODEL
         value: ""
       - key: GEMINI_API_KEY
         value: ""
+      - key: GEMINI_MODEL
+        value: ""
       - key: ANTHROPIC_API_KEY
+        value: ""
+      - key: ANTHROPIC_MODEL
         value: ""
       - key: PERPLEXITY_API_KEY
         value: ""
+      - key: PERPLEXITY_MODEL
+        value: ""
+      - key: POLLINATIONS_MODEL
+        value: ""
+      # Google Drive OAuth
       - key: GOOGLE_CLIENT_ID
         value: ""
       - key: GOOGLE_CLIENT_SECRET
@@ -38,19 +57,38 @@ services:
         value: https://touchunique-serveur.onrender.com/api/google/callback
       - key: PUBLIC_BASE_URL
         value: https://touchunique-serveur.onrender.com
+      # Réseaux sociaux — jetons et identifiants laissés vides.
       - key: FACEBOOK_APP_ID
         value: ""
       - key: FACEBOOK_APP_SECRET
+        value: ""
+      - key: FACEBOOK_ACCESS_TOKEN
+        value: ""
+      - key: FACEBOOK_PAGE_ID
         value: ""
       - key: INSTAGRAM_APP_ID
         value: ""
       - key: INSTAGRAM_APP_SECRET
         value: ""
+      - key: INSTAGRAM_ACCESS_TOKEN
+        value: ""
+      - key: INSTAGRAM_USER_ID
+        value: ""
       - key: LINKEDIN_CLIENT_ID
         value: ""
       - key: LINKEDIN_CLIENT_SECRET
         value: ""
+      - key: LINKEDIN_ACCESS_TOKEN
+        value: ""
+      - key: LINKEDIN_ORG_ID
+        value: ""
+      - key: LINKEDIN_PERSON_ID
+        value: ""
       - key: X_CLIENT_ID
         value: ""
       - key: X_CLIENT_SECRET
+        value: ""
+      - key: X_ACCESS_TOKEN
+        value: ""
+      - key: X_USER_ID
         value: ""
